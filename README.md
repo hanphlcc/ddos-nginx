@@ -1,4 +1,4 @@
-# 🔥 Next-Gen Goloris Attack - Nginx Killer 🚀
+# 🔥 Goloris Attack 🚀
 
 ### **💀 Overview**
 
